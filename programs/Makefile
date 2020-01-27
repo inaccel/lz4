@@ -82,7 +82,7 @@ lz4: $(OBJFILES) lz4-exe.o
 	$(CC) $(FLAGS) $^ -o $@$(EXT)
 else
 lz4: $(OBJFILES)
-	$(CC) $(FLAGS) $^ -o $@$(EXT)
+	$(CC) $(FLAGS) $^ -o $@$(EXT) -lcoral-api
 endif
 
 

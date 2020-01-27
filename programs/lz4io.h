@@ -121,6 +121,12 @@ int LZ4IO_setContentSize(LZ4IO_prefs_t* const prefs, int enable);
 /* Default setting : 0 == src file preserved */
 void LZ4IO_setRemoveSrcFile(LZ4IO_prefs_t* const prefs, unsigned flag);
 
+/* Default setting : 0 (disabled) */
+int LZ4IO_setInAccel(LZ4IO_prefs_t* const prefs, unsigned parallelism);
+
+/* Default setting : 64 MB */
+size_t LZ4IO_setInAccelChunkSize(LZ4IO_prefs_t* const prefs, size_t chunkSize);
+
 /* Default setting : 0 == favor compression ratio
  * Note : 1 only works for high compression levels (10+) */
 void LZ4IO_favorDecSpeed(LZ4IO_prefs_t* const prefs, int favor);

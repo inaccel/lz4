@@ -58,6 +58,7 @@
 #define LZ4F_STATIC_LINKING_ONLY
 #include "lz4frame.h"
 #include "lz4io.h"
+#include <inaccel/coral.h>
 
 
 /*****************************
@@ -124,6 +125,8 @@ struct LZ4IO_prefs_s {
   unsigned favorDecSpeed;
   const char* dictionaryFilename;
   int removeSrcFile;
+  unsigned inaccel;
+  size_t chunkSize;
 };
 
 /**************************************
@@ -174,6 +177,8 @@ LZ4IO_prefs_t* LZ4IO_defaultPreferences(void)
   ret->favorDecSpeed = 0;
   ret->dictionaryFilename = NULL;
   ret->removeSrcFile = 0;
+  ret->inaccel = 0;
+  ret->chunkSize = 0;
   return ret;
 }
 
@@ -293,6 +298,26 @@ void LZ4IO_setRemoveSrcFile(LZ4IO_prefs_t* const prefs, unsigned flag)
   prefs->removeSrcFile = (flag>0);
 }
 
+int LZ4IO_setInAccel(LZ4IO_prefs_t* const prefs, unsigned parallelism)
+{
+    prefs->inaccel = parallelism;
+    return prefs->inaccel;
+}
+
+size_t LZ4IO_setInAccelChunkSize(LZ4IO_prefs_t* const prefs, size_t chunkSize)
+{
+    static const size_t minChunkSize = 8 MB;
+    static const size_t maxChunkSize = 2 GB;
+    if (chunkSize < minChunkSize) chunkSize = minChunkSize;
+    if (chunkSize > maxChunkSize) chunkSize = maxChunkSize;
+    size_t blockNum = chunkSize / LEGACY_BLOCKSIZE;
+    size_t leftover = chunkSize % LEGACY_BLOCKSIZE;
+    if (leftover) blockNum++;
+    chunkSize = blockNum * LEGACY_BLOCKSIZE;
+    prefs->chunkSize = chunkSize;
+    return prefs->chunkSize;
+}
+
 
 
 /* ************************************************************************ **
@@ -388,11 +413,200 @@ static int LZ4IO_LZ4_compress(const char* src, char* dst, int srcSize, int dstSi
     return LZ4_compress_fast(src, dst, srcSize, dstSize, 1);
 }
 
+int LZ4IO_compressFilename_Legacy_InAccel( LZ4IO_prefs_t* const prefs, const char* input_filename, const char* output_filename)
+{
+    int parallel_chunks = prefs->inaccel;
+    size_t blocks_per_chunk = prefs->chunkSize / (8 MB);
+    unsigned long long filesize = 0;
+    unsigned long long compressedfilesize = MAGICNUMBER_SIZE;
+    const int outBuffSize = LZ4_compressBound(LEGACY_BLOCKSIZE);
+    int idx, ret, end;
+
+    ret = 0;
+    end = 0;
+
+    char* in_buff[parallel_chunks];
+    char* out_buff[parallel_chunks];
+    unsigned int* in_size_buff[parallel_chunks];
+    unsigned int* out_size_buff[parallel_chunks];
+    session sess[parallel_chunks];
+
+    for(idx = 0; idx < parallel_chunks; ++idx) {
+        /* Allocate Memory */
+        in_buff[idx] = (char*)cube_alloc(LEGACY_BLOCKSIZE*blocks_per_chunk);
+        out_buff[idx] = (char*)cube_alloc(outBuffSize*blocks_per_chunk);
+        in_size_buff[idx] = (unsigned int*)cube_alloc(blocks_per_chunk*sizeof(unsigned int));
+        out_size_buff[idx] = (unsigned int*)cube_alloc(blocks_per_chunk*sizeof(unsigned int));
+        sess[idx] = NULL;
+
+        if (in_buff[idx] == NULL || out_buff[idx] == NULL ||
+            in_size_buff[idx] == NULL || out_size_buff[idx] == NULL ) {
+            ret += -1;
+    }   }
+
+    if(ret < 0 ) {
+        for(idx = 0; idx < parallel_chunks; ++idx) {
+            cube_free(in_buff[idx]);
+            cube_free(out_buff[idx]);
+            cube_free(in_size_buff[idx]);
+            cube_free(out_size_buff[idx]);
+        }
+        return -1;
+    }
+
+    char out_size[MAGICNUMBER_SIZE];
+    FILE* const finput = LZ4IO_openSrcFile(input_filename);
+    FILE* foutput;
+    request req;
+    unsigned int blockSize_in_kb = LEGACY_BLOCKSIZE/1024;
+
+    /* Init */
+    struct timeval tm1;
+    gettimeofday(&tm1, NULL);
+    if (finput == NULL)
+        EXM_THROW(20, "%s : open file error ", input_filename);
+
+    foutput = LZ4IO_openDstFile(prefs, output_filename);
+    if (foutput == NULL) {
+        fclose(finput);
+        EXM_THROW(20, "%s : open file error ", input_filename);
+    }
+
+    /* Write Archive Header */
+    LZ4IO_writeLE32(out_size, LEGACY_MAGICNUMBER);
+    {   size_t const writeSize = fwrite(out_size, 1, MAGICNUMBER_SIZE, foutput);
+        if (writeSize != MAGICNUMBER_SIZE)
+            EXM_THROW(22, "Write error : cannot write header");
+    }
+
+    while (1) {
+        int outSize;
+        for(idx = 0; idx < parallel_chunks; ++idx) {
+            cube_rename(in_buff[idx]);
+            // cube_rename(out_buff[idx]);
+            cube_rename(in_size_buff[idx]);
+            cube_rename(out_size_buff[idx]);
+
+            size_t const inSize = fread(in_buff[idx], (size_t)1, (size_t)LEGACY_BLOCKSIZE*blocks_per_chunk, finput);
+            unsigned int inSize_int = inSize;
+            assert(inSize <= LEGACY_BLOCKSIZE*blocks_per_chunk);
+
+            unsigned int block_number = (inSize - 1)/LEGACY_BLOCKSIZE + 1;
+            int bIdx = 0;
+            for(bIdx; bIdx < blocks_per_chunk; bIdx++) {
+                if(bIdx < block_number) {
+                    unsigned int block_size = LEGACY_BLOCKSIZE;
+                    if (bIdx*LEGACY_BLOCKSIZE + block_size > inSize)
+                        block_size = inSize - bIdx*LEGACY_BLOCKSIZE;
+                    in_size_buff[idx][bIdx] = block_size;
+                }
+                else in_size_buff[idx][bIdx] = 0;
+            }
+
+            if (inSize > 0) {
+                filesize += inSize;
+                /* Create request to Compress Block */
+                req = request_create("com.xilinx.vitis.dataCompression.lz4.compress");
+                request_arg(req, 0, 0, in_buff[idx]);
+                request_arg(req, 1, 0, out_buff[idx]);
+                request_arg(req, 2, 0, out_size_buff[idx]);
+                request_arg(req, 3, 0, in_size_buff[idx]);
+                request_arg(req, 4, sizeof(unsigned int), &blockSize_in_kb);
+                request_arg(req, 5, sizeof(unsigned int), &inSize_int);
+                /* Send request to Compress Block */
+                sess[idx] = inaccel_submit(req);
+                request_free(req);
+            }
+            else {
+                sess[idx] = 0;
+                end = 1;
+                break;
+        }   }
+        for(idx = 0; idx < parallel_chunks; ++idx) {
+            if(sess[idx]) {
+                /* Wait for session completion */
+                ret += inaccel_wait(sess[idx]);
+                if(ret) break;
+
+                int bIdx = 0;
+                for(bIdx; bIdx < blocks_per_chunk; bIdx++) {
+                    if(in_size_buff[idx][bIdx] != 0) {
+                        /* Read compressed block size */
+                        outSize = out_size_buff[idx][bIdx];
+                        compressedfilesize += outSize+4;
+                        /* Write Block */
+                        assert(outSize > 0);
+                        assert(outSize < outBuffSize);
+                        LZ4IO_writeLE32(out_size, (unsigned)outSize);
+
+                        {
+                            size_t writeSize = fwrite(out_size, 1, 4, foutput);
+                            writeSize += fwrite(out_buff[idx] + LEGACY_BLOCKSIZE*bIdx, 1, outSize, foutput);
+                            if (writeSize != (size_t)(outSize+4))
+                            EXM_THROW(24, "Write error : cannot write compressed block");
+                    }   }
+                    DISPLAYUPDATE(2, "\rRead : %i MB    ==> %.2f%%    ",
+                               (int)(filesize>>20), (double)compressedfilesize/filesize*100);
+            }   }
+            else break;
+        }
+        if(end) break;
+    }
+
+    if(ret < 0 ) {
+        fclose(finput);
+        fclose(foutput);
+        for(idx = 0; idx < parallel_chunks; ++idx) {
+            cube_free(in_buff[idx]);
+            cube_free(out_buff[idx]);
+            cube_free(in_size_buff[idx]);
+            cube_free(out_size_buff[idx]);
+        }
+        return -1;
+    }
+
+    if (ferror(finput)) EXM_THROW(25, "Error while reading %s ", input_filename);
+
+    /* Status */
+    struct timeval tm2;
+    gettimeofday(&tm2, NULL);
+    double t = ((double)(tm2.tv_sec - tm1.tv_sec)) + ((double)(tm2.tv_usec - tm1.tv_usec)) / 1000000;
+    filesize += !filesize;    /* avoid division by zero (ratio) */
+    DISPLAYLEVEL(2, "\r%79s\r", "");    /* blank line */
+    DISPLAYLEVEL(2,"Compressed %llu bytes into %llu bytes ==> %.2f%%\n",
+        filesize, compressedfilesize, (double)compressedfilesize / filesize * 100);
+    {   double const seconds = (double)t;
+        DISPLAYLEVEL(4,"Done in %.2f s ==> %.2f MB/s\n", seconds,
+            ((double)filesize) / seconds / 1024 / 1024);
+    }
+
+    /* Close & Free */
+    fclose(finput);
+    fclose(foutput);
+    for(idx = 0; idx < parallel_chunks; ++idx) {
+        cube_free(in_buff[idx]);
+        cube_free(out_buff[idx]);
+        cube_free(in_size_buff[idx]);
+        cube_free(out_size_buff[idx]);
+    }
+
+    return 0;
+}
+
 /* LZ4IO_compressFilename_Legacy :
  * This function is intentionally "hidden" (not published in .h)
  * It generates compressed streams using the old 'legacy' format */
 int LZ4IO_compressFilename_Legacy(LZ4IO_prefs_t* const prefs, const char* input_filename, const char* output_filename, int compressionlevel)
 {
+    if (prefs->inaccel && compressionlevel < 3) {
+        if (!LZ4IO_compressFilename_Legacy_InAccel(prefs, input_filename, output_filename))
+            return 0;
+        else {
+            DISPLAYLEVEL(2, "\r%79s\r", "");   /* blank line */
+            DISPLAYLEVEL(2, "WARNING: FPGA compression failed, falling back to the reference implementation.\n");
+        }
+    }
+
     typedef int (*compress_f)(const char* src, char* dst, int srcSize, int dstSize, int cLevel);
     compress_f const compressionFunction = (compressionlevel < 3) ? LZ4IO_LZ4_compress : LZ4_compress_HC;
     unsigned long long filesize = 0;
@@ -406,27 +620,27 @@ int LZ4IO_compressFilename_Legacy(LZ4IO_prefs_t* const prefs, const char* input_
 
     /* Init */
     clock_t const clockStart = clock();
-    if (finput == NULL)
-        EXM_THROW(20, "%s : open file error ", input_filename);
+        if (finput == NULL)
+                EXM_THROW(20, "%s : open file error ", input_filename);
 
-    foutput = LZ4IO_openDstFile(prefs, output_filename);
-    if (foutput == NULL) {
-        fclose(finput);
-        EXM_THROW(20, "%s : open file error ", input_filename);
-    }
+        foutput = LZ4IO_openDstFile(prefs, output_filename);
+        if (foutput == NULL) {
+                fclose(finput);
+                EXM_THROW(20, "%s : open file error ", input_filename);
+        }
 
-    /* Allocate Memory */
-    in_buff = (char*)malloc(LEGACY_BLOCKSIZE);
-    out_buff = (char*)malloc((size_t)outBuffSize + 4);
-    if (!in_buff || !out_buff)
-        EXM_THROW(21, "Allocation error : not enough memory");
+        /* Allocate Memory */
+        in_buff = (char*)malloc(LEGACY_BLOCKSIZE);
+        out_buff = (char*)malloc((size_t)outBuffSize + 4);
+        if (!in_buff || !out_buff)
+                EXM_THROW(21, "Allocation error : not enough memory");
 
-    /* Write Archive Header */
-    LZ4IO_writeLE32(out_buff, LEGACY_MAGICNUMBER);
-    {   size_t const writeSize = fwrite(out_buff, 1, MAGICNUMBER_SIZE, foutput);
-        if (writeSize != MAGICNUMBER_SIZE)
-            EXM_THROW(22, "Write error : cannot write header");
-    }
+        /* Write Archive Header */
+        LZ4IO_writeLE32(out_buff, LEGACY_MAGICNUMBER);
+        {    size_t const writeSize = fwrite(out_buff, 1, MAGICNUMBER_SIZE, foutput);
+                if (writeSize != MAGICNUMBER_SIZE)
+                        EXM_THROW(22, "Write error : cannot write header");
+        }
 
     /* Main Loop */
     while (1) {
@@ -891,9 +1105,157 @@ static void LZ4IO_fwriteSparseEnd(FILE* file, unsigned storedSkips)
 }
 
 
+// static unsigned long long LZ4IO_decodeLegacyStream_Accel( LZ4IO_prefs_t* const prefs, FILE* finput, FILE* foutput)
+// {
+//     int parallel_chunks = prefs->inaccel;
+//     size_t blocks_per_chunk = prefs->chunkSize / (8 MB);
+//     unsigned long long filesize = 0;
+//     long int const start_position = ftell(finput);
+//     unsigned long long compressedfilesize = MAGICNUMBER_SIZE;
+//     const int inBuffSize = LZ4_compressBound(LEGACY_BLOCKSIZE);
+//     int idx, ret, end;
+//
+//     idx = 0;
+//     ret = 0;
+//     end = 0;
+//
+//     char* in_buff[parallel_chunks];
+//     char* out_buff[parallel_chunks];
+//     unsigned int* in_size_buff[parallel_chunks];
+//     unsigned int* in_compr_size_buff[parallel_chunks];
+//     session sess[parallel_chunks];
+//     unsigned int blockSize_in_kb = LEGACY_BLOCKSIZE/1024;
+//
+//     for(idx = 0; idx < parallel_chunks; ++idx) {
+//         /* Allocate Memory */
+//         in_buff[idx] = (char*)cube_alloc(LEGACY_BLOCKSIZE*blocks_per_chunk);
+//         out_buff[idx] = (char*)cube_alloc(outBuffSize*blocks_per_chunk);
+//         in_size_buff[idx] = (unsigned int*)cube_alloc(blocks_per_chunk*sizeof(unsigned int));
+//         in_compr_size_buff[idx] = (unsigned int*)cube_alloc(blocks_per_chunk*sizeof(unsigned int));
+//         sess[idx] = NULL;
+//
+//         if (in_buff[idx] == NULL || out_buff[idx] == NULL ||
+//             in_size_buff[idx] == NULL || in_compr_size_buff[idx] == NULL ) {
+//             ret += -1;
+//     }   }
+//
+//     if(ret < 0 ) {
+//         for(idx = 0; idx < parallel_chunks; ++idx) {
+//             cube_free(in_buff[idx]);
+//             cube_free(out_buff[idx]);
+//             cube_free(in_size_buff[idx]);
+//             cube_free(in_compr_size_buff[idx]);
+//         }
+//         // UTIL_fseek(finput, start_position, SEEK_SET);
+//         return -1;
+//     }
+//
+//     unsigned long long streamSize = 0;
+//     unsigned storedSkips = 0;
+//
+//     /* Main Loop */
+//     while (1) {
+//         unsigned int blockSize;
+//         idx = 0;
+//         // for(idx = 0; idx < parallel_chunks; ++idx) {
+//             cube_rename(in_buff[idx]);
+//             // cube_rename(out_buff[idx]);
+//             cube_rename(in_size_buff[idx]);
+//             cube_rename(out_size_buff[idx]);
+//
+//             int bIdx = 0;
+//             for(bIdx; bIdx < blocks_per_chunk; bIdx++) {
+//                 in_size_buff[idx][bIdx] = LEGACY_BLOCKSIZE;
+//                 /* Block Size */
+//                 if(!end) {
+//                     {
+//                         char blockSizeChar[4];
+//                         size_t const sizeCheck = fread(blockSizeChar, 1, 4, finput);
+//                         if (sizeCheck == 0) {
+//                             /* Nothing to read : file read is completed */
+//                             end = bIdx+1;
+//                             in_compr_size_buff[idx][bIdx] = 0;
+//                             continue;
+//                         }
+//                         else if (sizeCheck != 4) EXM_THROW(52, "Read error : cannot access block size ");
+//                     }
+//                     blockSize = LZ4IO_readLE32(blockSizeChar);           /* Convert to Little Endian */
+//                     if (blockSize > LZ4_COMPRESSBOUND(LEGACY_BLOCKSIZE)) {
+//                         /* Cannot read next block : maybe new stream ? */
+//                         ret += -1;
+//                         break;
+//                     }
+//                     in_compr_size_buff[idx][bIdx] = blockSize;
+//                     /* Read Block */
+//                     {
+//                         size_t const sizeCheck = fread(&in_buff[idx][bIdx*LEGACY_BLOCKSIZE], 1, blockSize, finput);
+//                         if (sizeCheck!=blockSize) EXM_THROW(52, "Read error : cannot access compressed block !");
+//                     }
+//                 }
+//                 else in_compr_size_buff[idx][bIdx] = 0;
+//             }
+//
+//             /* Submit Request */
+//             if(end - 1 != 0) {
+//                 unsigned int valid_blocks = blocks_per_chunk;
+//                 if(end) valid_blocks = end -1;
+//                 /* Create request to Decompress Block */
+//                 req = request_create("com.xilinx.vitis.dataCompression.lz4.decompress");
+//                 request_arg(req, 0, 0, in_buff[idx]);
+//                 request_arg(req, 1, 0, out_buff[idx]);
+//                 request_arg(req, 2, 0, in_size_buff[idx]);
+//                 request_arg(req, 3, 0, in_compr_size_buff[idx]);
+//                 request_arg(req, 4, sizeof(unsigned int), &blockSize_in_kb);
+//                 request_arg(req, 5, sizeof(unsigned int), &valid_blocks);
+//                 /* Send request to Compress Block */
+//                 sess[idx] = inaccel_submit(req);
+//                 request_free(req);
+//             }
+//             else {
+//                 sess[idx] = 0;
+//                 end = 1;
+//                 break;
+//             }
+//         // }
+//
+//         // for(idx = 0; idx < parallel_chunks; ++idx) {
+//             if(sess[idx]) {
+//                 /* Wait for session completion */
+//                 ret += inaccel_wait(sess[idx]);
+//                 if(ret) break;
+//
+//                 int bIdx = 0;
+//                 for(bIdx; bIdx < blocks_per_chunk; bIdx++) {
+//                     if(in_compr_size_buff[idx][bIdx] != 0) {
+//                         /* Write Block */
+//                         int const decodeSize = in_size_buff[idx][bIdx];
+//                         streamSize += (unsigned long long)decodeSize;
+//                         storedSkips = LZ4IO_fwriteSparse(prefs, foutput, out_buff, (size_t)decodeSize, storedSkips); /* success or die */
+//     }   }
+//     if (ferror(finput)) EXM_THROW(54, "Read error : ferror");
+//
+//     LZ4IO_fwriteSparseEnd(foutput, storedSkips);
+//
+//     /* Free */
+//     free(in_buff);
+//     free(out_buff);
+//
+//     return streamSize;
+// }
+
 static unsigned g_magicRead = 0;   /* out-parameter of LZ4IO_decodeLegacyStream() */
 static unsigned long long LZ4IO_decodeLegacyStream(LZ4IO_prefs_t* const prefs, FILE* finput, FILE* foutput)
 {
+    // int ret = 0;
+    // if (prefs->inaccel) {
+    //     if (!LZ4IO_decodeLegacyStream_Accel( prefs, finput,  foutput))
+    //         return 0;
+    //     else {
+    //         DISPLAYLEVEL(2, "\r%79s\r", "");    /* blank line */
+    //         DISPLAYLEVEL(2, "WARNING: InAccel Decompression failed, Falling back to Software %s\n", "");
+    //     }
+    // }
+
     unsigned long long streamSize = 0;
     unsigned storedSkips = 0;
 
@@ -1053,7 +1415,7 @@ static unsigned long long LZ4IO_decompressLZ4F(LZ4IO_prefs_t* const prefs, dRess
 #define PTSIZET (PTSIZE / sizeof(size_t))
 static unsigned long long LZ4IO_passThrough(LZ4IO_prefs_t* const prefs, FILE* finput, FILE* foutput, unsigned char MNstore[MAGICNUMBER_SIZE])
 {
-	size_t buffer[PTSIZET];
+    size_t buffer[PTSIZET];
     size_t readBytes = 1;
     unsigned long long total = MAGICNUMBER_SIZE;
     unsigned storedSkips = 0;

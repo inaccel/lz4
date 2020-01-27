@@ -158,6 +158,9 @@ static int usage_advanced(const char* exeName)
         DISPLAY( " -c2,-hc: very high compression \n");
         DISPLAY( " -y     : overwrite output without prompting \n");
     }
+    DISPLAY( " -F     : Use FPGA acceleration (default:disabled) \n");
+    DISPLAY( " -FP#   : parallelism (default: 8)\n");
+    DISPLAY( " -FC#   : set chunk size to # bytes >= 8 MB (default: 64 MB)\n");
     return 0;
 }
 
@@ -180,6 +183,17 @@ static int usage_longhelp(const char* exeName)
     DISPLAY( "               + for compression, output to filename%s \n", LZ4_EXTENSION);
     DISPLAY( "               + for decompression, output to filename without '%s'\n", LZ4_EXTENSION);
     DISPLAY( "                    > if input filename has no '%s' extension : error \n", LZ4_EXTENSION);
+    DISPLAY( "\n");
+    DISPLAY( "Acceleration Options : \n");
+    DISPLAY( "-----------------------\n");
+    DISPLAY( "-F   => Enable Acceleration\n");
+    DISPLAY( "-FP# => Set number of parallel chunks\n");
+    DISPLAY( "-FC# => Set chunk size to # bytes, alligned to 8 MB\n");
+    DISPLAY( "        keywords KB, MB are accepted\n");
+    DISPLAY( "Can be aggregated. For example :\n");
+    DISPLAY( "          %s -F -FC8MB -FP8 filename \n", exeName);
+    DISPLAY( "    is equivalent to :\n");
+    DISPLAY( "          %s -FC8MBP8 filename \n", exeName);
     DISPLAY( "\n");
     DISPLAY( "Compression levels : \n");
     DISPLAY( "---------------------\n");
@@ -473,6 +487,48 @@ int main(int argc, const char** argv)
 
                     /* Use Legacy format (ex : Linux kernel compression) */
                 case 'l': legacy_format = 1; blockSize = 8 MB; break;
+
+                case 'F':
+                    legacy_format = 1;
+                    LZ4IO_setInAccel(prefs, 8);
+                    LZ4IO_setInAccelChunkSize(prefs, 64 MB);
+                    while (argument[1]!=0) {
+                        int exitAccelProperties=0;
+                        switch(argument[1])
+                        {
+                        case 'P':
+                            argument ++;
+                            if (argument[1] < '0' || argument[1] > '9') {
+                                badusage(exeName);
+                            } else {
+                                unsigned P;
+                                argument++;
+                                P = readU32FromChar(&argument);
+                                argument--;
+                                LZ4IO_setInAccel(prefs, P);
+                                DISPLAYLEVEL(2, "using %u parallel chunks \n", (U32)(P));
+                                break;
+                            }
+                        case 'C':
+                            argument ++;
+                            if (argument[1] < '0' || argument[1] > '9') {
+                                badusage(exeName);
+                            } else {
+                                unsigned C;
+                                argument++;
+                                C = readU32FromChar(&argument);
+                                argument--;
+                                size_t chunkSize = LZ4IO_setInAccelChunkSize(prefs, C);
+                                DISPLAYLEVEL(2, "using chunks of size %u MB \n", (U32)(chunkSize>>20));
+                                break;
+                            }
+                        default :
+                            exitAccelProperties=1;
+                            break;
+                        }
+                        if (exitAccelProperties) break;
+                    }
+                    break;
 
                     /* Decoding */
                 case 'd': mode = om_decompress; break;
